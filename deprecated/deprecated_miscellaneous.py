@@ -18,7 +18,7 @@ def mkdir(path):
 
 
 def load_configs(file_path):
-    cfg_file = file_path
+    cfg_file = os.path.join('conf', file_path)
     with open(cfg_file, 'r') as config_file:
         cfgs = yaml.safe_load(config_file)
 

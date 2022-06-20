@@ -11,6 +11,6 @@ Download pretrained models from https://drive.google.com/drive/folders/1NbV3NZlg
 | squeezenet1.0  | 47.381 | 78.115 |
 | mobilenet_v2   | 51.214 | 81.866 |
 | densenet161    | 56.540 | 86.375  |
+| vitb16    | 53.875 | 84.375  |
 
-## Tensoflow 2.x
 

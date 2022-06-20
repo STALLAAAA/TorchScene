@@ -1,259 +1,412 @@
-# This code is modified from https://github.com/CSAILVision/places365/blob/master/train_placesCNN.py
-
-import os
-import time
-import datetime
+# modified from https://pytorch.org/tutorials/beginner/finetuning_torchvision_models_tutorial.html
+import copy
 import logging
-import os.path as osp
+import os
+import errno
+import time
+import hydra
 import torch
-import torch.nn as nn
-
+import PIL
+from omegaconf import DictConfig
+from torch import nn, optim
+from torch.utils.data import DataLoader
+from torchmetrics.functional import accuracy
+from torchvision import datasets, transforms
 import torchvision.models as models
-import torchvision.transforms as transforms
-import torchvision.datasets as datasets
-
-from utils.miscellaneous import load_configs, collect_env_info, mkdir, save_checkpoint
-from utils.distributed import get_rank
-from utils.logger import setup_logger
 from utils.meter import AverageMeter, ProgressMeter
-from utils.metric import accuracy
-from utils.lr_scheduler import adjust_learning_rate
-import models.wideresnet as wideresnet
+from torch.utils.collect_env import get_pretty_env_info
+from torch.utils.tensorboard import SummaryWriter
 
-CONFIG_FILE = 'basic.yml'
 
-best_acc1 = 0
-
-model_names = sorted(name for name in models.__dict__
-    if name.islower() and not name.startswith("__")
-    and callable(models.__dict__[name]))
-
-def main():
-    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-
-    global best_acc1
-    
-    run_time = str(datetime.datetime.now())
-    cfgs = load_configs(CONFIG_FILE)
-
-    # create log dir and weight dir
-    mkdir(cfgs['weight_dir'])
-    mkdir(cfgs['log_dir'])
-    
-    # create logger
-    log_dir = osp.join(cfgs['log_dir'], cfgs['arch'])
-    mkdir(log_dir)
-
-    cfgs['log_name'] = cfgs['arch'] + '_' + cfgs['dataset']
-    logger = setup_logger(cfgs['log_name'], log_dir, get_rank(), run_time + '.txt')
-
+@hydra.main(version_base=None, config_path="../conf", config_name="train")
+def main(cfgs: DictConfig):
+    logger = logging.getLogger(cfgs.arch)
     logger.info("Collecting env info (might take some time)")
     logger.info("\n" + collect_env_info())
-    logger.info("Loaded configuration file {}".format(CONFIG_FILE))
-    logger.info("Running with config:\n{}".format(cfgs))
-    
-    #  create model
-    logger.info("=> creating model '{}'".format(cfgs['arch']))
-    model = models.__dict__[cfgs['arch']]()
-    
-    if cfgs['arch'].lower().startswith('wideresnet'):
-        # a customized resnet model with last feature map size as 14x14 for better class activation mapping
-        model  = wideresnet.resnet50(num_classes=cfgs['num_classes'])
-    else:
-        model = models.__dict__[cfgs['arch']](num_classes=cfgs['num_classes'])
-
-    if cfgs['arch'].lower().startswith('alexnet') or cfgs['arch'].lower().startswith('vgg'):
-        model.features = torch.nn.DataParallel(model.features)
-        model.cuda()
-    else:
-        model = torch.nn.DataParallel(model).cuda()
-    logger.info("=> created model '{}'".format(model.__class__.__name__))
+    writer = SummaryWriter(os.path.join(cfgs.tensorborad_log_dir, time.ctime().replace(' ', '_').replace(':', '-')))
+    # create model
+    logger.info("getting model '{}' from torch hub".format(cfgs.arch))
+    model, input_size = initialize_model(
+        model_name=cfgs.arch,
+        num_classes=cfgs.num_classes,
+        feature_extract=cfgs.feature_extract,
+        use_pretrained=cfgs.pretrained,
+    )
+    logger.info("model: '{}' is successfully loaded".format(model.__class__.__name__))
     logger.info("model structure: {}".format(model))
-    num_gpus = torch.cuda.device_count()
-    logger.info("using {} GPUs".format(num_gpus))
+    # Data augmentation and normalization for training
+    # Just normalization for validation
+    logger.info("Initializing Datasets and Dataloaders...")
+    logger.info("loading data {} from {}".format(cfgs.dataset, cfgs.data_path))
+    dataloaders_dict = load_data(
+        input_size=input_size,
+        batch_size=cfgs.batch_size,
+        data_path=cfgs.data_path,
+        num_workers=cfgs.workers
+    )
+    # Detect if we have a GPU available
+    device = torch.device(cfgs.device if torch.cuda.is_available() else "cpu")
 
-    # optionally resume from a checkpoint
-    if cfgs['resume']:
-        if osp.isfile(cfgs['resume']):
-            logger.info("=> loading checkpoint '{}'".format(cfgs['resume']))
-            checkpoint = torch.load(cfgs['resume'])
-            cfgs['start_epoch'] = checkpoint['epoch']
-            best_acc1 = checkpoint['best_acc1']
-            model.load_state_dict(checkpoint['state_dict'])
-            logger.info("=> loaded checkpoint '{}' (epoch {})"
-                  .format(cfgs['resume'], checkpoint['epoch']))
-        else:
-            logger.info("=> no checkpoint found at '{}'".format(cfgs['resume']))
-
-    torch.backends.cudnn.benchmark = True
-
-    # Data loading code
-    traindir = osp.join(cfgs['data_path'], 'train')
-    valdir = osp.join(cfgs['data_path'], 'val')
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
-
-    train_loader = torch.utils.data.DataLoader(
-        datasets.ImageFolder(traindir, transforms.Compose([
-            transforms.RandomResizedCrop(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize,
-        ])),
-        batch_size=cfgs['batch_size'], shuffle=True,
-        num_workers=cfgs['workers'], pin_memory=True)
-
-    val_loader = torch.utils.data.DataLoader(
-        datasets.ImageFolder(valdir, transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize,
-        ])),
-        batch_size=cfgs['batch_size'], shuffle=False,
-        num_workers=cfgs['workers'], pin_memory=True)
-
-    # define loss function (criterion) and pptimizer
-    criterion = nn.CrossEntropyLoss().cuda()
-
-    optimizer = torch.optim.SGD(model.parameters(), cfgs['lr'],
-                                momentum=cfgs['momentum'],
-                                weight_decay=float(cfgs['weight_decay']))
-
-    # if cfgs['evaluate']:
-    #     validate(val_loader, model, criterion, cfgs)
-    #     return
-
-    # for epoch in range(cfgs['start_epoch'], cfgs['epochs']):
-    #     adjust_learning_rate(optimizer, epoch, cfgs)
-
-    #     # train for one epoch
-    #     train(train_loader, model, criterion, optimizer, epoch, cfgs)
-
-    #     # evaluate on validation set
-    #     acc1 = validate(val_loader, model, criterion, cfgs)
-
-    #     # remember best acc@1 and save checkpoint
-    #     is_best = acc1 > best_acc1
-    #     best_acc1 = max(acc1, best_acc1)
-    #     save_checkpoint({
-    #         'epoch': epoch + 1,
-    #         'arch': cfgs['arch'],
-    #         'state_dict': model.state_dict(),
-    #         'best_acc1': best_acc1,
-    #     }, is_best, cfgs['weight_dir'] + '/' + cfgs['arch'].lower())
-
-    logger.info("start to test the best model")
-    best_weight = cfgs['weight_dir'] + '/' + cfgs['arch'].lower() + '_best.pth.tar'
-    if osp.isfile(best_weight):
-        logger.info("=> loading best model '{}'".format(best_weight))
-        checkpoint = torch.load(best_weight)
-        best_acc1 = checkpoint['best_acc1']
-        epoch = checkpoint['epoch']
-        model.load_state_dict(checkpoint['state_dict'])
-
-        logger.info("=> loaded checkpoint '{}' (val Acc@1 {})"
-                    .format(best_weight, best_acc1))
+    # Gather the parameters to be optimized/updated in this run. If we are
+    #  finetuning we will be updating all parameters. However, if we are
+    #  doing feature extract method, we will only update the parameters
+    #  that we have just initialized, i.e. the parameters with requires_grad
+    #  is True.
+    params_to_update = model.parameters()
+    param_log_info = ''
+    if cfgs.feature_extract:
+        params_to_update = []
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                params_to_update.append(param)
+                param_log_info += "\t{}".format(name)
     else:
-        logger.info("=> no best model found at '{}'".format(best_weight))
-    
-    acc1 = validate(val_loader, model, criterion, cfgs)
-    
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                param_log_info += "\t{}".format(name)
+    logger.info("Params to learn:\n" + param_log_info)
 
-def train(train_loader, model, criterion, optimizer, epoch, cfgs):
-    logger = logging.getLogger('{}.train'.format(cfgs['log_name']))
-    
-    batch_time = AverageMeter('Time', ':6.3f')
-    data_time = AverageMeter('Data', ':6.3f')
-    losses = AverageMeter('Loss', ':.4e')
-    top1 = AverageMeter('Acc@1', ':6.2f')
-    top5 = AverageMeter('Acc@5', ':6.2f')
-    progress = ProgressMeter(
-        len(train_loader),
-        [batch_time, data_time, losses, top1, top5],
-        prefix="Epoch: [{}]".format(epoch))
+    # Observe that all parameters are being optimized
+    optimizer_ft = optim.SGD(params_to_update, lr=cfgs.lr, momentum=cfgs.momentum)
+    # Setup the loss fxn
+    criterion = nn.CrossEntropyLoss()
 
-    # switch to train mode
-    model.train()
-
-    end = time.time()
-    for i, (images, target) in enumerate(train_loader):
-        # measure data loading time
-        data_time.update(time.time() - end)
-
-        images = images.cuda(non_blocking=True)
-        target = target.cuda(non_blocking=True)
-        
-        # compute output
-        output = model(images)
-        loss = criterion(output, target)
-
-        # measure accuracy and record loss
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
-        losses.update(loss.item(), images.size(0))
-        top1.update(acc1[0], images.size(0))
-        top5.update(acc5[0], images.size(0))
-
-        # compute gradient and do SGD step
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
-
-        if i % cfgs['print_freq'] == 0:
-            logger.info(progress.display(i))
+    # Train and evaluate
+    model_ft = train_model(model, dataloaders_dict, device, criterion, optimizer_ft, logger,
+                           print_freq=cfgs.print_freq, num_epochs=cfgs.epochs, is_inception=(cfgs.arch == "inception"),
+                           tensorboard_plugin=writer
+                           )
+    mkdir(cfgs.weight_dir)
+    torch.save(model_ft.state_dict(), os.path.join(cfgs.weight_dir, cfgs.arch) + '.ckpt')
+    logger.info("model is saved at {}".format(os.path.abspath(os.path.join(cfgs.weight_dir, cfgs.arch) + '.ckpt')))
 
 
-def validate(val_loader, model, criterion, cfgs):
-    logger = logging.getLogger('{}.validate'.format(cfgs['log_name']))
+def load_data(input_size, data_path, batch_size, num_workers) -> dict[DataLoader, DataLoader]:
+    """transform data and load data into dataloader. Images should be arranged in this way by default: ::
 
-    batch_time = AverageMeter('Time', ':6.3f')
-    losses = AverageMeter('Loss', ':.4e')
-    top1 = AverageMeter('Acc@1', ':6.2f')
-    top5 = AverageMeter('Acc@5', ':6.2f')
-    progress = ProgressMeter(
-        len(val_loader),
-        [batch_time, losses, top1, top5],
-        prefix='Test: ')
+        root/my_dataset/train/dog/xxx.png
+        root/my_dataset/train/dog/xxy.png
+        root/my_dataset/train/dog/[...]/xxz.png
 
-    # switch to evaluate mode
-    model.eval()
+        root/my_dataset/val/cat/123.png
+        root/my_dataset/val/cat/nsdf3.png
+        root/my_dataset/val/cat/[...]/asd932_.png
 
-    with torch.no_grad():
-        end = time.time()
-        for i, (images, target) in enumerate(val_loader):
-            images = images.cuda(non_blocking=True)
-            target = target.cuda(non_blocking=True)
-            # compute output
-            output = model(images)
-            loss = criterion(output, target)
 
-            # measure accuracy and record loss
-            acc1, acc5 = accuracy(output, target, topk=(1, 5))
-            losses.update(loss.item(), images.size(0))
-            top1.update(acc1[0], images.size(0))
-            top5.update(acc5[0], images.size(0))
+    notice that the directory of your training data must be names as 'train', and
+    the directory name of your validation data must be named as 'val', and they should
+    under the same directory.
 
-            # measure elapsed time
-            batch_time.update(time.time() - end)
+    Args:
+        input_size (int): transformed image resolution, such as 224.
+        data_path (string): eg. xx/my_dataset/
+        batch_size (int): batch size
+        num_workers (int): number of pytorch DataLoader worker subprocess
+    """
+    data_transforms = {
+        'train': transforms.Compose([
+            transforms.Resize(
+                input_size,
+                interpolation=transforms.InterpolationMode.BICUBIC,
+            ),
+            transforms.CenterCrop(input_size),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ]),
+        'val': transforms.Compose([
+            transforms.Resize(
+                input_size,
+                interpolation=transforms.InterpolationMode.BICUBIC,
+            ),
+            transforms.CenterCrop(input_size),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ]),
+    }
+
+    # Create training and validation datasets
+    image_datasets = {x: datasets.ImageFolder(os.path.join(data_path, x), data_transforms[x]) for x in
+                      ['train', 'val']}
+    # Create training and validation dataloaders
+    dataloaders_dict = {
+        x: torch.utils.data.DataLoader(
+            image_datasets[x], batch_size=batch_size, shuffle=True, num_workers=num_workers
+        ) for x in ['train', 'val']
+    }
+    return dataloaders_dict
+
+
+def train_model(model, dataloaders, device, criterion, optimizer, logger, print_freq, num_epochs, tensorboard_plugin=None, is_inception=False):
+    """a simple train and evaluate script modified from https://pytorch.org/tutorials/beginner/finetuning_torchvision_models_tutorial.html.
+
+        Args:
+            model (nn.Module): model to be trained.
+            dataloaders (dict): should be a dict in the format of {'train': DataLoader, 'val': DataLoader}.
+            device (Any): device.
+            criterion (Any): loss function.
+            optimizer (Any): optimizer.
+            logger (Any): using logging.logger to print and log training information.
+            print_freq (int): logging frequency.eg. 10 means logger will print information when 10 batches are trained or evaluated.
+            num_epochs (int): training epochs
+            tensorboard_plugin(Any): torch.utils.tensorboard.SummaryWriter
+            is_inception (bool): please refer to https://discuss.pytorch.org/t/how-to-optimize-inception-model-with-auxiliary-classifiers/7958
+        """
+    # Send the model to GPU
+    model = model.to(device)
+    since = time.time()
+    best_model_wts = copy.deepcopy(model.state_dict())
+    for epoch in range(num_epochs):
+        # Each epoch has a training and validation phase
+        for phase in ['train', 'val']:
+            # statistics
+            batch_time = AverageMeter('Time', ':6.3f')
+            data_time = AverageMeter('Data', ':6.3f')
+            losses = AverageMeter('Loss', ':.4e')
+            top1 = AverageMeter('Acc@1', ':6.5f')
+            top5 = AverageMeter('Acc@5', ':6.5f')
+            progress = ProgressMeter(
+                len(dataloaders[phase]),
+                [batch_time, data_time, losses, top1, top5],
+                prefix="Epoch: [{}]".format(epoch))
+
+            if phase == 'train':
+                model.train()  # Set model to training mode
+            else:
+                model.eval()   # Set model to evaluate mode
+
+            # Iterate over data.
             end = time.time()
+            for i, (inputs, labels) in enumerate(dataloaders[phase]):
+                # measure data loading time
+                data_time.update(time.time() - end)
 
-            batch_time.update(time.time() - end)
-            end = time.time()
+                inputs = inputs.to(device)
+                labels = labels.to(device)
 
-            if i % cfgs['print_freq'] == 0:
-                logger.info(progress.display(i))
+                # zero the parameter gradients
+                optimizer.zero_grad()
 
-        # TODO: this should also be done with the ProgressMeter
-        logger.info(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
-            .format(top1=top1, top5=top5))
+                # forward
+                # track history if only in train
+                with torch.set_grad_enabled(phase == 'train'):
+                    # Get model outputs and calculate loss
+                    # Special case for inception because in training it has an auxiliary output. In train
+                    #   mode we calculate the loss by summing the final output and the auxiliary output
+                    #   but in testing we only consider the final output.
+                    if is_inception and phase == 'train':
+                        # From https://discuss.pytorch.org/t/how-to-optimize-inception-model-with-auxiliary-classifiers/7958
+                        outputs, aux_outputs = model(inputs)
+                        loss1 = criterion(outputs, labels)
+                        loss2 = criterion(aux_outputs, labels)
+                        loss = loss1 + 0.4*loss2
+                    else:
+                        outputs = model(inputs)
+                        loss = criterion(outputs, labels)
 
-    return top1.avg
+                    # backward + optimize only if in training phase
+                    if phase == 'train':
+                        loss.backward()
+                        optimizer.step()
+
+                # measure accuracy and record loss
+                acc1 = accuracy(outputs, labels, top_k=1)
+                acc5 = accuracy(outputs, labels, top_k=5)
+                losses.update(loss.item(), inputs.size(0))
+                top1.update(acc1, inputs.size(0))
+                top5.update(acc5, inputs.size(0))
+                if phase == 'train':
+                    tensorboard_plugin.add_scalar('loss/train', loss, i)
+                    tensorboard_plugin.add_scalar('acc1/train', acc1, i)
+                    tensorboard_plugin.add_scalar('acc5/train', acc5, i)
+                else:
+                    tensorboard_plugin.add_scalar('loss/val', loss, i)
+                    tensorboard_plugin.add_scalar('acc1/val', acc1, i)
+                    tensorboard_plugin.add_scalar('acc5/val', acc5, i)
+
+                # measure elapsed time
+                batch_time.update(time.time() - end)
+                end = time.time()
+                if i % print_freq == 0:
+                    logger.info(progress.display(i))
+    time_elapsed = time.time() - since
+    logger.info('Training complete in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
+
+    # load best model weights
+    model.load_state_dict(best_model_wts)
+
+    return model
 
 
+def set_parameter_requires_grad(model, feature_extracting):
+    if feature_extracting:
+        for param in model.parameters():
+            param.requires_grad = False
 
-if __name__ == '__main__':
+
+def initialize_model(model_name, num_classes, feature_extract, use_pretrained=False) -> (nn.Module, int):
+    """get models from https://pytorch.org/hub/.
+
+    Args:
+        model_name (string): model name.
+        num_classes (int): the output dimension of model classifier.
+        feature_extract (bool): if true, will freeze all the gradients.
+        use_pretrained (bool): if true, model will load pretrained weights.
+    Return:
+        model, input size.
+    """
+    # Initialize these variables which will be set in this if statement. Each of these variables is model specific.
+    model_ft = None
+    input_size = 0
+
+    if model_name == "resnet18":
+        """ Resnet18
+        """
+        model_ft = models.resnet18(pretrained=use_pretrained)
+
+        set_parameter_requires_grad(model_ft, feature_extract)
+        num_ftrs = model_ft.fc.in_features
+        model_ft.fc = nn.Linear(num_ftrs, num_classes)
+        input_size = 224
+
+    if model_name == "resnet34":
+        """ Resnet34
+        """
+        model_ft = models.resnet34(pretrained=use_pretrained)
+
+        set_parameter_requires_grad(model_ft, feature_extract)
+        num_ftrs = model_ft.fc.in_features
+        model_ft.fc = nn.Linear(num_ftrs, num_classes)
+        input_size = 224
+
+    if model_name == "resnet50":
+        """ Resnet50
+        """
+        model_ft = models.resnet50(pretrained=use_pretrained)
+
+        set_parameter_requires_grad(model_ft, feature_extract)
+        num_ftrs = model_ft.fc.in_features
+        model_ft.fc = nn.Linear(num_ftrs, num_classes)
+        input_size = 224
+
+    if model_name == "resnet101":
+        """ Resnet101
+        """
+        model_ft = models.resnet101(pretrained=use_pretrained)
+
+        set_parameter_requires_grad(model_ft, feature_extract)
+        num_ftrs = model_ft.fc.in_features
+        model_ft.fc = nn.Linear(num_ftrs, num_classes)
+        input_size = 224
+
+    if model_name == "resnet152":
+        """ Resnet152
+        """
+        model_ft = models.resnet152(pretrained=use_pretrained)
+
+        set_parameter_requires_grad(model_ft, feature_extract)
+        num_ftrs = model_ft.fc.in_features
+        model_ft.fc = nn.Linear(num_ftrs, num_classes)
+        input_size = 224
+
+    elif model_name == "alexnet":
+        """ Alexnet
+        """
+        model_ft = models.alexnet(pretrained=use_pretrained)
+        set_parameter_requires_grad(model_ft, feature_extract)
+        num_ftrs = model_ft.classifier[6].in_features
+        model_ft.classifier[6] = nn.Linear(num_ftrs, num_classes)
+        input_size = 224
+
+    elif model_name == "vgg":
+        """ VGG11_bn
+        """
+        model_ft = models.vgg11_bn(pretrained=use_pretrained)
+        set_parameter_requires_grad(model_ft, feature_extract)
+        num_ftrs = model_ft.classifier[6].in_features
+        model_ft.classifier[6] = nn.Linear(num_ftrs, num_classes)
+        input_size = 224
+
+    elif model_name == "squeezenet":
+        """ Squeezenet
+        """
+        model_ft = models.squeezenet1_0(pretrained=use_pretrained)
+        set_parameter_requires_grad(model_ft, feature_extract)
+        model_ft.classifier[1] = nn.Conv2d(512, num_classes, kernel_size=(1, 1), stride=(1, 1))
+        model_ft.num_classes = num_classes
+        input_size = 224
+
+    elif model_name == "densenet121":
+        """ Densenet121
+        """
+        model_ft = models.densenet121(pretrained=use_pretrained)
+        set_parameter_requires_grad(model_ft, feature_extract)
+        num_ftrs = model_ft.classifier.in_features
+        model_ft.classifier = nn.Linear(num_ftrs, num_classes)
+        input_size = 224
+
+    elif model_name == "densenet161":
+        """ Densenet161
+        """
+        model_ft = models.densenet161(pretrained=use_pretrained)
+        set_parameter_requires_grad(model_ft, feature_extract)
+        num_ftrs = model_ft.classifier.in_features
+        model_ft.classifier = nn.Linear(num_ftrs, num_classes)
+        input_size = 224
+
+    elif model_name == "inception":
+        """ Inception v3
+        Be careful, expects (299,299) sized images and has auxiliary output
+        """
+        model_ft = models.inception_v3(pretrained=use_pretrained)
+        set_parameter_requires_grad(model_ft, feature_extract)
+        # Handle the auxilary net
+        num_ftrs = model_ft.AuxLogits.fc.in_features
+        # Handle the primary net
+        num_ftrs = model_ft.fc.in_features
+        model_ft.fc = nn.Linear(num_ftrs, num_classes)
+        input_size = 299
+
+    elif model_name == "vision_transformer":
+        """ Vision Transformer base 16
+        """
+        model_ft = models.vit_b_16(pretrained=use_pretrained)
+        set_parameter_requires_grad(model_ft, feature_extract)
+        # Handle the primary net
+        num_ftrs = model_ft.hidden_dim
+        model_ft.heads = nn.Linear(num_ftrs, num_classes)
+        input_size = 224
+
+    else:
+        print("Invalid model name, exiting...")
+        exit()
+
+    return model_ft, input_size
+
+
+def mkdir(path):
+    try:
+        os.makedirs(path)
+    except OSError as e:
+        if e.errno != errno.EEXIST:
+            raise
+
+
+def get_pil_version():
+    return "\n        Pillow ({})".format(PIL.__version__)
+
+
+def collect_env_info():
+    env_str = get_pretty_env_info()
+    env_str += get_pil_version()
+    return env_str
+
+
+def adjust_learning_rate(optimizer, epoch, cfgs):
+    """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
+    lr = cfgs['lr'] * (0.1 ** (epoch // 30))
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
+
+if __name__ == "__main__":
     main()

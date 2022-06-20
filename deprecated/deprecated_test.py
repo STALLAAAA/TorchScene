@@ -8,7 +8,7 @@ print(torch.__version__)
 
 arch = 'squeezenet1_0'
 # model_file = 'checkpoints/%s_best.pth.tar' % arch
-save_pt_path = 'weights/%s_places365.pt' % arch
+save_pt_path = 'checkpoints/%s_places365.pt' % arch
 file_name = 'categories_places365.txt'
 img_name = "imgs/12.jpg"
 device = torch.device("cuda:2")

@@ -5,9 +5,9 @@ A scene recognition tool based on pytorch
 ## Installation
 
 ```bash
-conda env create -f environment.yml python=3.7
+conda env create -f environment.yml python=3.9
 
-conda activate scene_pytorch_tf
+conda activate torch-scene
 
 export PYTHONPATH=$PYTHONPATH:$(pwd)
 ```
@@ -29,27 +29,22 @@ These images are 256x256 images, in a more friendly directory structure that in 
 sh download_data_pytorch.sh
 ```
 
-### 2. Train the model with multiple GPUs
-
+### 2. Train the model
+For train configs, please refer to conf/train.yaml 
 ```bash
-python tools/train.py
+python tools/train.py batch_size=128
 ```
 
-### 3. Remove the .module
 
+### 3. carry out the inferring
+
+Donwload pretrained weights from [[Google Drive]](https://drive.google.com/drive/folders/1NbV3NZlgbqnLSd9zwZoz8kFpNQjUYolT?usp=sharing), or use the weights you trained in local.
+For infer configs, please refer to conf/infer.yaml 
 ```python
-python scripts/remove_pytorch_module.py
+python tools/infer.py img_path=root/TorchScene/imgs/12.jpg weight_path=root/TorchScene/checkpoints/vision_transformer1654506720.0398195.ckpt
 ```
 
-### 4. Test a model
-
-Donwload pretrained weights from [[Google Drive]](https://drive.google.com/drive/folders/1NbV3NZlgbqnLSd9zwZoz8kFpNQjUYolT?usp=sharing)
-
-```python
-python tools/test.py
-```
-
-### 5. Convert a model to TorchScript
+### 4. Convert a model to TorchScript
 
 ```python
 python scripts/convert_torchscript.py

@@ -1,0 +1,21 @@
+data_path: /root/TorchScene/places365_standard/
+device: cuda:0
+weight_dir: checkpoints
+arch: vision_transformer
+workers: 6
+epochs: 7
+start_epoch: 0
+batch_size: 128
+lr: 1e-4
+momentum: 0.9
+weight_decay: 1e-5
+print_freq: 100
+pretrained: True
+feature_extract: False
+num_classes: 365
+dataset: places365
+
+hydra:
+  run:
+    dir: /root/TorchScene/logs/train/${now:%Y-%m-%d}/${now:%H-%M-%S}
+tensorborad_log_dir: /root/TorchScene/logs/tensor_board
